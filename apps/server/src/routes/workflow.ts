@@ -16,7 +16,7 @@ import {
   snooze,
 } from '../services/reminders.js';
 import { toPlanDto, toReminderDto } from '../services/serialization.js';
-import { applyCalibration, recomputeHitRate, undoCalibration } from '../services/calibration.js';
+import { applyCalibration, recalibrateAfterAmend, undoCalibration } from '../services/calibration.js';
 
 export const workflowRouter = Router();
 workflowRouter.use(authenticate());
@@ -251,7 +251,7 @@ workflowRouter.post(
     });
     run();
 
-    const calibration = applyCalibration(ctx.libraryId, plan.inspiration_id as string, id);
+    const calibration = await applyCalibration(ctx.libraryId, plan.inspiration_id as string, id);
     syncStatus(plan.inspiration_id as string);
     ok(res, { resultId: id, ...calibration }, 201);
   }),
@@ -267,16 +267,22 @@ workflowRouter.post(
       .prepare('SELECT * FROM shoot_result WHERE id = ? AND library_id = ?')
       .get(req.params.id, ctx.libraryId) as Record<string, unknown> | undefined;
     if (!row) throw errors.notFound('回填记录');
+    // 修订即"重新回填"：刷新 filled_at，保证证据按时间排序时口径稳定可复算
     db.prepare(
-      'UPDATE shoot_result SET hit_level = ?, miss_reasons = ?, note = ?, actual_shot_at = ? WHERE id = ?',
+      `UPDATE shoot_result SET hit_level = ?, miss_reasons = ?, note = ?, actual_shot_at = ?, filled_at = ?
+       WHERE id = ?`,
     ).run(
       input.hitLevel,
       toJson(input.missReasons),
       input.note ?? null,
       input.actualShotAt ?? null,
+      nowIso(),
       req.params.id,
     );
-    const stats = recomputeHitRate(row.inspiration_id as string);
+    // 修订会改变偏差主因 → 证据指纹随之改变，必须按同一口径重新判定/收紧，
+    // 否则判断与留痕会停留在修订前的旧结论上。
+    const stats = await recalibrateAfterAmend(ctx.libraryId, row.inspiration_id as string, req.params.id);
+    syncStatus(row.inspiration_id as string);
     ok(res, stats);
   }),
 );
@@ -286,7 +292,7 @@ workflowRouter.post(
   ah(async (req, res) => {
     const ctx = ctxOf(req);
     requireInspiration(req.params.id, ctx.libraryId);
-    undoCalibration(req.params.calibrationId, ctx.libraryId, req.params.id);
+    await undoCalibration(req.params.calibrationId, ctx.libraryId, req.params.id);
     ok(res, { undone: true });
   }),
 );

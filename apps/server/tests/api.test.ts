@@ -215,7 +215,7 @@ describe('E5 实拍回填与校准', () => {
     expect(again.body.error.code).toBe('RESULT_ALREADY_FILLED');
   });
 
-  it('连续 3 次同因未命中 → 收紧判断，且可撤销', async () => {
+  it('连续 3 次同因（时间偏差）未命中 → 收紧对应字段（窗口时间容差），且可撤销', async () => {
     for (let i = 0; i < 2; i += 1) {
       const windows = await call('get', `/api/inspirations/${cardId}/windows`);
       const usable = windows.body.items.filter((w: { verdict: string }) => w.verdict !== 'bad');
@@ -226,11 +226,17 @@ describe('E5 实拍回填与校准', () => {
       });
     }
     const detail = await call('get', `/api/inspirations/${cardId}`);
-    expect(detail.body.item.timing.azimuthTolerance).toBeLessThan(15);
+    // 时间偏差只能收紧窗口时间容差（12→9），不再像旧缺陷那样错收方位角
+    expect(detail.body.item.timing.windowToleranceMin).toBe(9);
+    expect(detail.body.item.timing.azimuthTolerance).toBe(15);
 
     const logs = await call('get', `/api/inspirations/${cardId}/calibration`);
     expect(logs.body.items.length).toBeGreaterThan(0);
+    expect(logs.body.items[0].field).toBe('window_tolerance_min');
     expect(logs.body.items[0].reason).toContain('收紧');
+    // 留痕必须带可复算证据：归一主因 + 三条证据窗口
+    expect(logs.body.items[0].cause).toBe('timing_off');
+    expect(logs.body.items[0].evidence).toHaveLength(3);
 
     const undo = await call(
       'post',
@@ -239,7 +245,7 @@ describe('E5 实拍回填与校准', () => {
     );
     expect(undo.status).toBe(200);
     const after = await call('get', `/api/inspirations/${cardId}`);
-    expect(after.body.item.timing.azimuthTolerance).toBe(15);
+    expect(after.body.item.timing.windowToleranceMin).toBe(12);
   });
 });
 
@@ -445,5 +451,189 @@ describe('E10 备份与质量门', () => {
     const res = await call('get', '/api/health');
     expect(res.body.db).toBe('ok');
     expect(Object.values(res.body.dirs).every((v) => v === 'ok')).toBe(true);
+  });
+});
+
+describe('E11 校准口径：混合偏差、重复收紧闸门、撤销/修订复算', () => {
+  let libId = '';
+
+  async function currentLibraryId(): Promise<string> {
+    const { getDb } = await import('../src/db.js');
+    const row = getDb().prepare('SELECT id FROM library LIMIT 1').get() as { id: string };
+    return row.id;
+  }
+
+  // 直接写 shoot_result 作为校准证据，绕开天气夹具下窗口数量的限制
+  async function seedMisses(card: string, reasons: string[][]): Promise<string[]> {
+    const { getDb, newId, toJson } = await import('../src/db.js');
+    const db = getDb();
+    if (!libId) libId = await currentLibraryId();
+    const ids: string[] = [];
+    const base = Date.now();
+    reasons.forEach((missReasons, i) => {
+      const id = newId();
+      const planId = newId();
+      const ts = new Date(base + i * 60000).toISOString();
+      db.prepare(
+        `INSERT INTO shoot_plan (id, library_id, inspiration_id, window_id, planned_at, leave_at,
+           commute_min, status, created_at, updated_at)
+         VALUES (?,?,?,NULL,?,NULL,30,'done',?,?)`,
+      ).run(planId, libId, card, ts, ts, ts);
+      db.prepare(
+        `INSERT INTO shoot_result (id, library_id, plan_id, inspiration_id, hit_level, miss_reasons,
+           actual_shot_at, actual_weather, note, filled_at, created_at)
+         VALUES (?,?,?,?, 'miss', ?, NULL, NULL, NULL, ?, ?)`,
+      ).run(id, libId, planId, card, toJson(missReasons), ts, ts);
+      ids.push(id);
+    });
+    return ids;
+  }
+
+  async function setupCalibrationCard(azimuthTolerance = 15): Promise<string> {
+    const created = await call('post', '/api/inspirations', { title: '校准口径验证卡' });
+    const id = created.body.id as string;
+    const place = await call('post', '/api/places', { name: '校准地点', city: '测试城' });
+    const spot = await call('post', '/api/spots', {
+      placeId: place.body.id,
+      lat: 31.2,
+      lng: 121.4,
+      cameraBearing: 90,
+    });
+    await call('post', `/api/inspirations/${id}/spot`, { spotId: spot.body.id });
+    await call('put', `/api/inspirations/${id}/timing`, {
+      timeAnchor: 'sunset_minus',
+      anchorOffsetMin: 40,
+      elevationRange: [-4, 10],
+      azimuthRange: [260, 280],
+      azimuthTolerance,
+      windowToleranceMin: 12,
+      weatherProfile: { cloudCoverPct: { min: 20, max: 80 }, precipProbPctMax: 30 },
+      seasonWindow: null,
+      notes: null,
+    });
+    return id;
+  }
+
+  it('连续 3 次混合偏差（时间/天气/光位）不判定同因、不收紧', async () => {
+    const id = await setupCalibrationCard();
+    await seedMisses(id, [['timing_off'], ['weather_mismatch'], ['light_direction_wrong']]);
+    const { applyCalibration } = await import('../src/services/calibration.js');
+    const out = await applyCalibration(libId, id, 'test');
+    expect(out.tightened).toHaveLength(0);
+
+    const detail = await call('get', `/api/inspirations/${id}`);
+    expect(detail.body.item.timing.azimuthTolerance).toBe(15);
+    expect(detail.body.item.timing.windowToleranceMin).toBe(12);
+    const logs = await call('get', `/api/inspirations/${id}/calibration`);
+    expect(logs.body.items).toHaveLength(0);
+  });
+
+  it('同批证据只收紧一次：再跑校准不会反复收紧', async () => {
+    const id = await setupCalibrationCard();
+    await seedMisses(id, [
+      ['light_direction_wrong'],
+      ['light_direction_wrong'],
+      ['light_direction_wrong'],
+    ]);
+    const { applyCalibration } = await import('../src/services/calibration.js');
+    const first = await applyCalibration(libId, id, 'test');
+    expect(first.tightened).toHaveLength(1);
+    expect(first.tightened[0]).toMatchObject({ field: 'azimuth_tolerance', before: 15, after: 10 });
+    expect((await call('get', `/api/inspirations/${id}`)).body.item.timing.azimuthTolerance).toBe(10);
+
+    const second = await applyCalibration(libId, id, 'test');
+    expect(second.tightened).toHaveLength(0);
+    expect((await call('get', `/api/inspirations/${id}`)).body.item.timing.azimuthTolerance).toBe(10);
+
+    const logs = await call('get', `/api/inspirations/${id}/calibration`);
+    expect(logs.body.items).toHaveLength(1);
+  });
+
+  it('撤销后同一批证据不会再次收紧；再来 3 次新的同因 miss 才会', async () => {
+    const id = await setupCalibrationCard();
+    await seedMisses(id, [
+      ['light_direction_wrong'],
+      ['light_direction_wrong'],
+      ['light_direction_wrong'],
+    ]);
+    const { applyCalibration, undoCalibration } = await import('../src/services/calibration.js');
+    expect((await applyCalibration(libId, id, 'test')).tightened[0].after).toBe(10);
+
+    const logId = ((await call('get', `/api/inspirations/${id}/calibration`)).body.items as { id: string }[])[0]
+      .id;
+    await undoCalibration(logId, libId, id);
+    expect((await call('get', `/api/inspirations/${id}`)).body.item.timing.azimuthTolerance).toBe(15);
+
+    // 旧证据还在，撤销后重跑也不能对同一批 miss 再收紧
+    expect((await applyCalibration(libId, id, 'test')).tightened).toHaveLength(0);
+    expect((await call('get', `/api/inspirations/${id}`)).body.item.timing.azimuthTolerance).toBe(15);
+
+    // 再来 3 次全新同因 miss → 才允许再收紧一档
+    await seedMisses(id, [
+      ['light_direction_wrong'],
+      ['light_direction_wrong'],
+      ['light_direction_wrong'],
+    ]);
+    const third = await applyCalibration(libId, id, 'test');
+    expect(third.tightened).toHaveLength(1);
+    expect(third.tightened[0]).toMatchObject({ field: 'azimuth_tolerance', before: 15, after: 10 });
+  });
+
+  it('回填修订改变主因后，按同一口径重新判定并收紧到对应字段', async () => {
+    const id = await setupCalibrationCard();
+    const ids = await seedMisses(id, [
+      ['timing_off'],
+      ['weather_mismatch'],
+      ['light_direction_wrong'],
+    ]);
+    const { applyCalibration } = await import('../src/services/calibration.js');
+    expect((await applyCalibration(libId, id, 'test')).tightened).toHaveLength(0);
+
+    // 自新向旧原始为 [光位(最新), 天气(中), 时间(最旧)]，三种因各一 → 混合偏差不收紧。
+    // 修订把前两条统一改为"时间"后，三条归一主因全部变成 timing → 应触发收紧。
+    const { getDb, toJson } = await import('../src/db.js');
+    const rows = getDb()
+      .prepare(
+        'SELECT id, miss_reasons FROM shoot_result WHERE inspiration_id = ? ORDER BY filled_at DESC, rowid DESC LIMIT 2',
+      )
+      .all(id) as { id: string; miss_reasons: string }[];
+    expect(JSON.parse(rows[0].miss_reasons)).toEqual(['light_direction_wrong']);
+    expect(JSON.parse(rows[1].miss_reasons)).toEqual(['weather_mismatch']);
+    for (const r of rows) {
+      getDb()
+        .prepare('UPDATE shoot_result SET miss_reasons = ? WHERE id = ?')
+        .run(toJson(['timing_off']), r.id);
+    }
+    const out = await applyCalibration(libId, id, 'test');
+    expect(out.tightened).toHaveLength(1);
+    expect(out.tightened[0]).toMatchObject({ field: 'window_tolerance_min', before: 12, after: 9 });
+  });
+
+  it('中间夹一次 hit 会打断连续性，不因滑动窗口误判', async () => {
+    const id = await setupCalibrationCard();
+    const { getDb, newId, toJson } = await import('../src/db.js');
+    if (!libId) libId = await currentLibraryId();
+    const db = getDb();
+    const now = Date.now();
+    const mk = (hitLevel: string, reasons: string[], agoMin: number): void => {
+      const ts = new Date(now - agoMin * 60000).toISOString();
+      const planId = newId();
+      db.prepare(
+        `INSERT INTO shoot_plan (id, library_id, inspiration_id, window_id, planned_at, leave_at,
+           commute_min, status, created_at, updated_at)
+         VALUES (?,?,?,NULL,?,NULL,30,'done',?,?)`,
+      ).run(planId, libId, id, ts, ts, ts);
+      db.prepare(
+        `INSERT INTO shoot_result (id, library_id, plan_id, inspiration_id, hit_level, miss_reasons,
+           actual_shot_at, actual_weather, note, filled_at, created_at)
+         VALUES (?,?,?,?, ?, ?, NULL, NULL, NULL, ?, ?)`,
+      ).run(newId(), libId, planId, id, hitLevel, toJson(reasons), ts, ts);
+    };
+    mk('miss', ['timing_off'], 40);
+    mk('miss', ['timing_off'], 30);
+    mk('hit', [], 20);
+    mk('miss', ['timing_off'], 10);
+    const { applyCalibration } = await import('../src/services/calibration.js');
+    expect((await applyCalibration(libId, id, 'test')).tightened).toHaveLength(0);
   });
 });
