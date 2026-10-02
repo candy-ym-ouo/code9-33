@@ -15,6 +15,7 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
   Upload,
   message,
@@ -306,6 +307,29 @@ export default function InspirationDetail() {
                 render: (_, r) => `${JSON.stringify(r.before)} → ${JSON.stringify(r.after)}`,
               },
               { title: '原因', dataIndex: 'reason' },
+              {
+                title: '判定依据',
+                width: 150,
+                render: (_, r) => {
+                  const causeLabel =
+                    r.cause === 'timing_off' ? '同因：时间差了' : r.cause === 'weather_mismatch' ? '同因：天气不符' : null;
+                  const evidenceCount = Array.isArray(r.evidence) ? r.evidence.length : 0;
+                  return (
+                    <Tooltip
+                      title={
+                        evidenceCount
+                          ? `口径 v${r.ruleVersion ?? 1}；触发收紧的 ${evidenceCount} 条回填：${(r.evidence as string[]).join(', ')}`
+                          : '历史记录（旧版口径，未存证据）'
+                      }
+                    >
+                      <Space size={4}>
+                        {causeLabel ? <Tag color="blue">{causeLabel}</Tag> : null}
+                        {evidenceCount ? <Tag>{evidenceCount} 条回填</Tag> : null}
+                      </Space>
+                    </Tooltip>
+                  );
+                },
+              },
               {
                 title: '操作',
                 width: 110,

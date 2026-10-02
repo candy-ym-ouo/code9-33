@@ -251,7 +251,7 @@ workflowRouter.post(
     });
     run();
 
-    const calibration = applyCalibration(ctx.libraryId, plan.inspiration_id as string, id);
+    const calibration = await applyCalibration(ctx.libraryId, plan.inspiration_id as string, id);
     syncStatus(plan.inspiration_id as string);
     ok(res, { resultId: id, ...calibration }, 201);
   }),
@@ -286,7 +286,7 @@ workflowRouter.post(
   ah(async (req, res) => {
     const ctx = ctxOf(req);
     requireInspiration(req.params.id, ctx.libraryId);
-    undoCalibration(req.params.calibrationId, ctx.libraryId, req.params.id);
+    await undoCalibration(req.params.calibrationId, ctx.libraryId, req.params.id);
     ok(res, { undone: true });
   }),
 );

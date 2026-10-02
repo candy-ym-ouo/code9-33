@@ -241,6 +241,161 @@ describe('E5 实拍回填与校准', () => {
     const after = await call('get', `/api/inspirations/${cardId}`);
     expect(after.body.item.timing.azimuthTolerance).toBe(15);
   });
+
+  /** 建一张独立卡并连续回填，避免与上面 cardId 的命中率串台 */
+  async function fillOnFreshCard(reasonsList: string[][]) {
+    const created = await call('post', '/api/inspirations', { title: `校准隔离卡-${Date.now()}` });
+    const id = created.body.id;
+    await call('post', `/api/inspirations/${id}/spot`, { spotId });
+    await call('put', `/api/inspirations/${id}/timing`, {
+      timeAnchor: 'sunset_minus',
+      anchorOffsetMin: 40,
+      elevationRange: [-4, 10],
+      azimuthRange: null,
+      azimuthTolerance: 15,
+      windowToleranceMin: 12,
+      weatherProfile: { precipProbPctMax: 20, cloudCoverPct: { min: 10, max: 80 } },
+      seasonWindow: null,
+      notes: null,
+    });
+    await call('post', `/api/inspirations/${id}/windows/recompute`, { days: 7 });
+    const windows = await call('get', `/api/inspirations/${id}/windows`);
+    const usable = windows.body.items.filter((w: { verdict: string }) => w.verdict !== 'bad');
+    const fills: unknown[] = [];
+    for (let i = 0; i < reasonsList.length; i += 1) {
+      const plan = await call('post', '/api/plans', { windowId: usable[i].id, commuteMin: 30 });
+      const res = await call('post', `/api/plans/${plan.body.id}/result`, {
+        hitLevel: 'miss',
+        missReasons: reasonsList[i],
+      });
+      fills.push(res.body);
+    }
+    return { id, fills };
+  }
+
+  it('连续 3 次混合偏差（时间+天气）不被判定同因：不收紧、不留收紧痕', async () => {
+    const { id, fills } = await fillOnFreshCard([
+      ['timing_off', 'weather_mismatch'],
+      ['timing_off', 'weather_mismatch'],
+      ['timing_off', 'weather_mismatch'],
+    ]);
+    for (const f of fills) {
+      expect((f as { tightened: unknown[] }).tightened).toHaveLength(0);
+    }
+    const detail = await call('get', `/api/inspirations/${id}`);
+    expect(detail.body.item.timing.azimuthTolerance).toBe(15);
+    const logs = await call('get', `/api/inspirations/${id}/calibration`);
+    expect(logs.body.items).toHaveLength(0);
+  });
+
+  it('三条原因交替（天气/混合/时间）不算同因，不收紧', async () => {
+    const { id } = await fillOnFreshCard([
+      ['weather_mismatch'],
+      ['timing_off', 'weather_mismatch'],
+      ['timing_off'],
+    ]);
+    const detail = await call('get', `/api/inspirations/${id}`);
+    expect(detail.body.item.timing.azimuthTolerance).toBe(15);
+    expect(detail.body.item.timing.weatherProfile.cloudCoverPct).toEqual({ min: 10, max: 80 });
+    const logs = await call('get', `/api/inspirations/${id}/calibration`);
+    expect(logs.body.items).toHaveLength(0);
+  });
+
+  it('撤销收紧后旧证据不会再触发；同一段继续回填也不反复收紧，打断后另起新段才可再收', async () => {
+    const { id } = await fillOnFreshCard([
+      ['timing_off'],
+      ['timing_off'],
+      ['timing_off'],
+    ]);
+    let detail = await call('get', `/api/inspirations/${id}`);
+    expect(detail.body.item.timing.azimuthTolerance).toBe(10);
+    let logs = await call('get', `/api/inspirations/${id}/calibration`);
+    expect(logs.body.items).toHaveLength(1);
+    const firstLogId = logs.body.items[0].id;
+
+    await call('post', `/api/inspirations/${id}/calibration/${firstLogId}/undo`, {});
+    detail = await call('get', `/api/inspirations/${id}`);
+    expect(detail.body.item.timing.azimuthTolerance).toBe(15);
+
+    // 第 4、5 次仍是同因 miss：属于同一连续段，不得再次收紧（旧 bug 会连收两档）
+    let windows = await call('get', `/api/inspirations/${id}/windows`);
+    let usable = windows.body.items.filter((w: { verdict: string }) => w.verdict !== 'bad');
+    for (let i = 3; i < 5; i += 1) {
+      const plan = await call('post', '/api/plans', { windowId: usable[i].id, commuteMin: 30 });
+      const res = await call('post', `/api/plans/${plan.body.id}/result`, {
+        hitLevel: 'miss',
+        missReasons: ['timing_off'],
+      });
+      expect(res.body.tightened).toHaveLength(0);
+    }
+    detail = await call('get', `/api/inspirations/${id}`);
+    expect(detail.body.item.timing.azimuthTolerance).toBe(15);
+    logs = await call('get', `/api/inspirations/${id}/calibration`);
+    expect(logs.body.items).toHaveLength(1); // 仍是撤销前那一条，没有新增收紧
+
+    // 一次 hit 打断连续；之后重新攒齐 3 次同因 miss → 新段，允许再收一档
+    windows = await call('get', `/api/inspirations/${id}/windows`);
+    usable = windows.body.items.filter((w: { verdict: string }) => w.verdict !== 'bad');
+    const hitPlan = await call('post', '/api/plans', { windowId: usable[5].id, commuteMin: 30 });
+    await call('post', `/api/plans/${hitPlan.body.id}/result`, { hitLevel: 'hit', missReasons: [] });
+    for (let i = 0; i < 3; i += 1) {
+      const plan = await call('post', '/api/plans', { windowId: usable[(i + 6) % usable.length].id, commuteMin: 30 });
+      await call('post', `/api/plans/${plan.body.id}/result`, {
+        hitLevel: 'miss',
+        missReasons: ['timing_off'],
+      });
+    }
+    detail = await call('get', `/api/inspirations/${id}`);
+    expect(detail.body.item.timing.azimuthTolerance).toBe(10);
+    logs = await call('get', `/api/inspirations/${id}/calibration`);
+    expect(logs.body.items).toHaveLength(2);
+  });
+
+  it('连续 3 次单因天气不符 → 只收窄云量区间，不碰方位角/窗口容差', async () => {
+    const { id } = await fillOnFreshCard([
+      ['weather_mismatch'],
+      ['weather_mismatch'],
+      ['weather_mismatch'],
+    ]);
+    const detail = await call('get', `/api/inspirations/${id}`);
+    expect(detail.body.item.timing.azimuthTolerance).toBe(15);
+    expect(detail.body.item.timing.windowToleranceMin).toBe(12);
+    expect(detail.body.item.timing.weatherProfile.cloudCoverPct).toEqual({ min: 15, max: 75 });
+    const logs = await call('get', `/api/inspirations/${id}/calibration`);
+    expect(logs.body.items).toHaveLength(1);
+    expect(logs.body.items[0].field).toBe('weather_profile.cloudCoverPct');
+    expect(logs.body.items[0].cause).toBe('weather_mismatch');
+    expect(logs.body.items[0].evidence).toHaveLength(3);
+    expect(logs.body.items[0].episodeId).toBeTruthy();
+  });
+
+  it('收紧与撤销后窗口立即按同一份条件复算（判定/撤销/窗口共用口径）', async () => {
+    const { id } = await fillOnFreshCard([
+      ['timing_off'],
+      ['timing_off'],
+      ['timing_off'],
+    ]);
+    let windows = await call('get', `/api/inspirations/${id}/windows`);
+    expect(windows.body.items).toHaveLength(7);
+    for (const w of windows.body.items) {
+      expect(w.stale).toBe(false);
+      expect(typeof w.computedAt).toBe('string');
+    }
+    const computedAfterTighten = windows.body.items.map(
+      (w: { date: string; computedAt: string }) => w.computedAt,
+    );
+
+    const logs = await call('get', `/api/inspirations/${id}/calibration`);
+    await call('post', `/api/inspirations/${id}/calibration/${logs.body.items[0].id}/undo`, {});
+    windows = await call('get', `/api/inspirations/${id}/windows`);
+    expect(windows.body.items).toHaveLength(7);
+    // 撤销触发了再一次复算（computed_at 不早于收紧后的批次）
+    windows.body.items.forEach((w: { date: string; computedAt: string }, i: number) => {
+      expect(w.computedAt >= computedAfterTighten[i]).toBe(true);
+    });
+    const detail = await call('get', `/api/inspirations/${id}`);
+    expect(detail.body.item.timing.azimuthTolerance).toBe(15);
+  });
 });
 
 describe('E6 画册闭环：缺口 → 补齐 → 发布', () => {
